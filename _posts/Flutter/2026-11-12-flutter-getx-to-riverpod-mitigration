@@ -1,0 +1,111 @@
+---
+title: GetX에서 Riverpod으로 전환하기 (Riverpod 2.x 기준 가이드)
+date: 2026-11-12 10:00:00 +0900
+categories: [Flutter, Riverpod]
+tags: [flutter, getx, riverpod, migration, clean-architecture]
+toc: true
+---
+
+GetX에서 Riverpod(2.x 기준)으로 전환할 때의 핵심 개념과 단계별 진행 순서를 정리한다.
+Clean Architecture(Data → Domain → Presentation) 구조로 나뉘어 있는 프로젝트라면 계층별로 차근차근 옮기기 좋아서 전환이 수월하다.
+
+## 1. 핵심 전환 개념 정리
+
+| 항목 | GetX 방식 | Riverpod 방식 |
+|------|-----------|---------------|
+| 의존성 주입 (DI) | `Get.lazyPut()`, `Get.find()` | `Provider` (컴파일 타임 안전, 전역 정의) |
+| 상태 관리 주체 | `GetxController` | `Notifier` 또는 `AsyncNotifier` (또는 `StateNotifier`) |
+| 반응형 상태값 | `RxBool`, `.obs`, `update()` | 불변 객체(State) + `ref.watch()` |
+| UI 바인딩 | `Obx()`, `GetBuilder`, `GetView` | `ConsumerWidget`, `ref.watch()`, `ref.read()` |
+| 최상단 설정 | `runApp(MyApp())` | `runApp(ProviderScope(child: MyApp()))` |
+
+## 2. 점진적 전환을 위한 단계별 진행 순서
+
+### 1단계: 라이브러리 추가 및 최상단 설정
+
+- `flutter_riverpod` 패키지를 추가한다. (필수)
+- 코드 생성 도구(`riverpod_annotation`, `build_runner`)는 필요에 따라 선택한다.
+- `main.dart`의 `runApp(MyApp())`을 `ProviderScope`로 감싼다.
+
+```dart
+void main() {
+  runApp(const ProviderScope(child: MyApp()));
+}
+```
+
+### 2단계: 최하단 인프라 및 의존성(DI) Provider 작성
+
+`initDependencies()`처럼 한곳에서 인스턴스를 생성하고 연쇄 주입하던 부분을 Riverpod Provider로 선언한다. 아래쪽 계층부터 순서대로 만든다.
+
+1. **Core / Network**: `dioClientProvider`
+2. **Data Source**: `remoteDataSourceProvider` (내부에서 `ref.watch(dioClientProvider)`로 주입)
+3. **Repository**: `customerRepositoryProvider`, `dashBoardRepositoryProvider` 등
+4. **UseCase**: `customerUseCaseProvider`, `dashBoardUseCaseProvider` 등
+
+```dart
+final dioClientProvider = Provider<DioClient>((ref) => DioClient());
+
+final remoteDataSourceProvider = Provider<RemoteDataSource>((ref) {
+  return RemoteDataSource(ref.watch(dioClientProvider));
+});
+
+final customerRepositoryProvider = Provider<CustomerRepository>((ref) {
+  return CustomerRepositoryImpl(ref.watch(remoteDataSourceProvider));
+});
+
+final customerUseCaseProvider = Provider<CustomerUseCase>((ref) {
+  return CustomerUseCase(ref.watch(customerRepositoryProvider));
+});
+```
+
+**장점**
+
+- `initDependencies()` 함수 전체를 삭제할 수 있다.
+- 지연 초기화(Lazy Initialization)가 기본으로 지원된다.
+
+### 3단계: Controller를 Notifier로 전환
+
+GetX의 `GetxController`는 상태와 비즈니스 로직이 섞여 있고, Rx 변수를 개별로 변경하는 경우가 많다. Riverpod에서는 아래 구조를 권장한다.
+
+1. **상태 데이터 클래스(State Class) 정의**
+   - Controller가 다루는 상태의 데이터 구조를 정의한다.
+   - 예: 로딩 상태, 에러 메시지, 결과 리스트
+2. **Notifier / AsyncNotifier 구현**
+   - 비동기 데이터 조회 위주라면 `AsyncNotifier<T>` 사용 (로딩, 에러, 성공 상태를 자동 관리)
+   - 일반 상태 변경 위주라면 `Notifier<T>` 사용
+
+| 상황 | 선택 |
+|------|------|
+| API 조회 결과를 보여주는 화면 | `AsyncNotifier<T>` |
+| 토글, 선택값, 폼 입력 등 동기 상태 | `Notifier<T>` |
+
+### 4단계: UI 바인딩 전환
+
+1. `StatelessWidget` / `StatefulWidget`을 `ConsumerWidget` / `ConsumerStatefulWidget`으로 변경한다.
+2. `build(BuildContext context, WidgetRef ref)`로 `WidgetRef`를 받는다.
+3. **상태 구독 (화면 갱신)**: `final state = ref.watch(myControllerProvider);`
+4. **이벤트/함수 호출 (버튼 클릭 등)**: `ref.read(myControllerProvider.notifier).fetchData();`
+
+### 5단계: 네비게이션 및 공통 서비스 정리
+
+- `Get.toNamed()`, `Get.back()` 등 GetX 라우팅을 사용했다면 Flutter 기본 `Navigator` 또는 `go_router`로 전환한다.
+- 이미 `RouteConfiguration.onGenerateRoute` 같은 구조가 잡혀 있다면 전환이 쉽다.
+- `CommonService`처럼 비동기 초기화가 필요한 서비스는 `FutureProvider`나 `ProviderScope`의 override 기능으로 초기화할 수 있다.
+
+## 3. 추천하는 전환 전략
+
+> 한 번에 전체를 바꾸지 말고 **모듈별로 전환**한다.
+{: .prompt-tip }
+
+- `main.dart`에 `ProviderScope`만 씌워 두면 **Riverpod과 GetX를 같은 프로젝트에서 동시에 사용할 수 있다.**
+- 규모가 작거나 테스트 성격이 강한 모듈(예: `SettingsController`, `FileController`)을 첫 번째 타깃으로 정해 먼저 전환한다.
+- 같은 패턴을 `DashBoard`, `Customer`, `Operate` 같은 메인 모듈로 확대해 나간다.
+
+### 전환 순서 요약
+
+1. `ProviderScope` 적용
+2. Core / Data Source / Repository / UseCase Provider 작성
+3. 작은 모듈의 Controller를 Notifier로 전환
+4. 해당 모듈의 UI를 `ConsumerWidget`으로 전환
+5. 같은 패턴으로 다른 모듈에 반복
+6. 모두 옮긴 뒤 GetX 의존성, 라우팅, `initDependencies()` 제거
